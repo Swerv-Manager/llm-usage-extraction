@@ -54,6 +54,20 @@ export interface CursorApiOptions {
 /** Grok Bot's cloud agents bill to the same dashboard. They are not Cursor IDE usage. */
 const isGrokBotModel = (model: string) => model === "grok-bot" || model.startsWith("grok-bot-");
 
+/**
+ * Product on a dashboard row. `clientType` is `UsageEventDisplay.client_type`: the team Usage
+ * page prints `grok-bot` as Product "Grok Bot" and leaves Model blank. `sand` is the older
+ * client type for the same product. Some replies use `product` for that same label.
+ */
+function isGrokProduct(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_]+/g, "-");
+  return normalized === "grok-bot" || normalized.startsWith("grok-bot-") || normalized === "sand";
+}
+
 function record(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("Invalid Cursor usage response.");
@@ -188,15 +202,21 @@ export async function* fetchCursorUsagePages(opts: CursorApiOptions): AsyncGener
         )
           continue;
         const timestamp = typeof row.timestamp === "string" ? Number(row.timestamp) : row.timestamp;
-        if (
-          typeof timestamp !== "number" ||
-          !Number.isSafeInteger(timestamp) ||
-          timestamp <= 0 ||
-          typeof row.model !== "string" ||
-          !row.model
-        )
+        const rawModel = typeof row.model === "string" ? row.model : "";
+        const model = rawModel.trim();
+        // Model-name detection stays the fallback. Product wins when Model is "-" on the dashboard.
+        const grok =
+          isGrokBotModel(model) ||
+          isGrokProduct(row.clientType) ||
+          isGrokProduct(row.client_type) ||
+          isGrokProduct(row.product);
+        if (typeof timestamp !== "number" || !Number.isSafeInteger(timestamp) || timestamp <= 0) {
           throw new Error("Invalid Cursor usage event.");
+        }
         if (timestamp < opts.since || timestamp > opts.until) continue;
+        // A blank model used to reject the whole page, so one Grok Bot row stopped the team read.
+        if (!model && !grok) continue;
+        const storedModel = model || "grok-bot";
         const tokens = {
           inputTokens: count(usage.inputTokens),
           outputTokens: count(usage.outputTokens),
@@ -210,7 +230,8 @@ export async function* fetchCursorUsagePages(opts: CursorApiOptions): AsyncGener
           JSON.stringify([
             accountId,
             timestamp,
-            row.model,
+            // Keep ids of rows that already named a model. A blank Grok Bot model is stored as grok-bot.
+            rawModel || storedModel,
             row.kind ?? null,
             row.conversationId ?? null,
             tokens,
@@ -222,7 +243,7 @@ export async function* fetchCursorUsagePages(opts: CursorApiOptions): AsyncGener
         if (seen.has(id)) continue;
         seen.add(id);
         events.push({
-          source: isGrokBotModel(row.model) ? "grok_bot" : "cursor_api",
+          source: grok ? "grok_bot" : "cursor_api",
           sessionId:
             typeof row.conversationId === "string" && row.conversationId
               ? row.conversationId
@@ -231,7 +252,7 @@ export async function* fetchCursorUsagePages(opts: CursorApiOptions): AsyncGener
           messageId: id,
           requestId: null,
           timestamp,
-          model: row.model,
+          model: storedModel,
           messageType: "assistant",
           ...tokens,
           reasoningTokens: null,
